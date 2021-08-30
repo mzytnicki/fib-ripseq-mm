@@ -1,0 +1,1586 @@
+---
+title: "Mouse Brain snoRNA"
+output: html_notebook
+---
+
+# Packages
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(GenomicRanges)
+library(Biostrings)
+library(BSgenome)
+library(annotatr)
+```
+
+
+# Commands for finding boxes
+
+Possible values of the C/D boxes.
+```{r}
+cBoxes <- c("C0"  = "[AG]TGATGA",
+            "C1"  = "[AG]TGATGG",
+            "C2"  = "[AG]TGAGGA",
+            "C3"  = "[AG]TGATGT",
+            "C4"  = "[AG]GGATGA",
+            "C5"  = "[AG]TGATGC",
+            "C6"  = "[AG]TGAAGA",
+            "C7"  = "[AG]TGATTA",
+            "C8"  = "[AG]AGATTA",
+            "C9"  = "[AG]TTATGA",
+            "C10" = "[AG]TGCTGA",
+            "C11" = "[TC]TGATGA")
+dBoxes <- c("D0"  = "CTGA",
+            "D1"  = "CAGA",
+            "D2"  = "ATGA",
+            "D3"  = "TTGA",
+            "D4"  = "CTCA",
+            "D5"  = "CTGT")
+```
+
+Some functions and constant variables
+```{r}
+findBox <- function(table, colName, box, isStart) {
+  matrixPos      <- ifelse(isStart, 1, 2)
+  matrixFunction <- ifelse(isStart, min, max)
+  colNameStart <- paste(colName, "start", sep = "_")
+  suppressWarnings(
+    tmp <- table %>%
+      dplyr::mutate(boxStart = map_dbl(map(str_locate_all(sequence, box), ~.[, matrixPos]), matrixFunction))
+  )
+  tmp %>%
+    dplyr::mutate(offset = if_else(rep(isStart, nrow(.)), 1L, str_length(sequence))) %>%
+    dplyr::mutate(boxStart = abs(offset - boxStart)) %>%
+    dplyr::select(-offset) %>%
+    dplyr::rename(!!colName := boxStart)
+}
+findBestBox <- function(table, colNames, boxes, isStart, bestPosition, newColName) {
+  newColNamePos = paste(newColName, "pos", sep = "_")
+  newColNameBox = paste(newColName, "box", sep = "_")
+  newColNBox    = paste("n", newColName, "box", sep = "_")
+  for (i in seq_along(colNames)) {
+    table <- findBox(table, colNames[[i]], boxes[[i]], isStart)
+  }
+ table %>%
+  dplyr::rowwise() %>% 
+  dplyr::mutate(n = sum(is.finite(dplyr::c_across(colNames)))) %>%
+  dplyr::ungroup() %>%
+  pivot_longer(all_of(colNames), names_to = "box", values_to = "position") %>%
+  group_by(across(c(-box, -position))) %>%
+  dplyr::mutate(offset = abs(position - bestPosition)) %>%
+  arrange(offset) %>%
+  dplyr::summarise(bestBox = dplyr::first(box), position = dplyr::first(position)) %>%
+  ungroup() %>%
+  dplyr::mutate(box = (position <= 10)) %>%
+  dplyr::mutate(bestBox = if_else(box, bestBox, NA_character_)) %>%
+  dplyr::mutate(position = if_else(box, position, NA_real_)) %>%
+  dplyr::select(-box) %>%
+  dplyr::rename(!!newColNamePos := position) %>%
+  dplyr::rename(!!newColNameBox := bestBox) %>%
+  dplyr::rename(!!newColNBox := n)
+}
+findInterBox <- function(table) {
+  c_size = 7
+  d_size = 4
+  table %>%
+      mutate(interbox = str_sub(sequence, C_pos + c_size, - D_pos - d_size - 2)) %>%
+      mutate("pc_A" = str_count(interbox, "A")) %>%
+      mutate("pc_C" = str_count(interbox, "C")) %>%
+      mutate("pc_G" = str_count(interbox, "G")) %>%
+      mutate("pc_T" = str_count(interbox, "T")) %>%
+      mutate("pc_A" = round(pc_A / str_length(interbox) * 100)) %>%
+      mutate("pc_C" = round(pc_C / str_length(interbox) * 100)) %>%
+      mutate("pc_G" = round(pc_G / str_length(interbox) * 100)) %>%
+      mutate("pc_T" = round(pc_T / str_length(interbox) * 100)) %>%
+      dplyr::select(- interbox)
+}
+findNucleotide <- function(table) {
+  table %>% dplyr::mutate("char_D_box" = str_sub(sequence, str_length(sequence) - D_pos - 4, str_length(sequence) - D_pos - 4))
+}
+bindNucleotide <- function(n1, n2) {
+  if (! is.character(n1)) return(FALSE)
+  if (! is.character(n2)) return(FALSE)
+  if (n1 == "A") return (n2 == "T")
+  if (n1 == "C") return (n2 == "G")
+  if (n1 == "G") return ((n2 == "C") | (n2 == "T"))
+  if (n1 == "T") return ((n2 == "A") | (n2 == "G"))
+  stop(paste0("Unknown character ", n1))
+}
+bindStrands <- function(s1, s2) {
+  s2 <- reverse(s2)
+  all(map2_lgl(str_split(s1, "")[[1]], str_split(s2, "")[[1]], bindNucleotide))
+}
+# 5' flanking regions starts before NRUGAUGA
+# 3' flanking regions starts after CUGA
+getFlank <- function(table, sequenceFileName, size) {
+  table <- table %>%
+    tibble::rowid_to_column("ID")
+  filterTable <- table %>%
+    dplyr::filter(! is.na(C_pos)) %>%
+    dplyr::filter(! is.na(D_pos))
+  dnaData <- readDNAStringSet(sequenceFileName)
+  firstStrandGR <- filterTable %>%
+    dplyr::mutate(end   = if_else(strand == "+", start + C_pos - 2, end - C_pos + size + 1)) %>%
+    dplyr::mutate(start = end - size + 1) %>%
+    makeGRangesFromDataFrame(ignore.strand = FALSE)
+  secondStrandGR <- filterTable %>%
+    dplyr::mutate(start = if_else(strand == "+", start + str_length(sequence) - D_pos, end - str_length(sequence) + D_pos - size + 1)) %>%
+    dplyr::mutate(end   = start + size - 1) %>%
+    makeGRangesFromDataFrame(ignore.strand = FALSE)
+  firstStrandSeq  <- getSeq(dnaData, firstStrandGR)
+  secondStrandSeq <- getSeq(dnaData, secondStrandGR)
+  sequences <- tibble("ID"           = filterTable %>% pull("ID"),
+                      "firstStrand"  = as.character(firstStrandSeq),
+                      "secondStrand" = as.character(secondStrandSeq))
+  table %>%
+    left_join(sequences, by = "ID") %>%
+    dplyr::select(-ID)
+}
+findHelix <- function(table, sequenceFileName, size) {
+  colName  <- paste0("isHarpin_", size)
+  nameFirstStrand  <- paste0("firstStrand_", size)
+  nameSecondStrand <- paste0("secondStrand_", size)
+  table <- getFlank(table, sequenceFileName, size) %>%
+    tibble::rowid_to_column("ID")
+  filterTable <- table %>%
+    dplyr::filter(! is.na(firstStrand)) %>%
+    dplyr::filter(! is.na(secondStrand)) %>%
+    dplyr::mutate(isHairpin = map2_lgl(firstStrand, secondStrand, bindStrands)) %>%
+    dplyr::select(ID, isHairpin)
+  table %>% 
+    left_join(filterTable, by = "ID") %>%
+    dplyr::select(-ID) %>%
+    dplyr::rename(!!colName := isHairpin) %>%
+    dplyr::rename(!!nameFirstStrand  := firstStrand) %>%
+    dplyr::rename(!!nameSecondStrand := secondStrand)
+}
+```
+
+
+
+# Pipeline
+
+## Fastqc
+
+Number of reads
+```{bash eval=FALSE}
+for i in *_R1_001.fastq.gz; do basename $i _R1_001.fastq.gz; echo $(($(zcat $i | wc -l) / 4)); done
+```
+IP-body-e15
+  113154429
+IP-brain-adult
+  83931985
+IP-brain-e15
+  129750463
+IP-placenta-e15
+  121300127
+
+Assess quality of the input files:
+```{bash eval=FALSE}
+for i in Data/Reads/Raw/*.fastq.gz; do
+    fastqc -o Data/Reads/Quality $i &
+done
+```
+
+## Trim reads
+```{bash eval=FALSE}
+module load bioinfo/cutadapt-2.1
+module load bioinfo/TrimGalore-0.6.0
+for i in *R1*.fastq.gz; do
+    trim_galore -o ~/work --paired --stringency 5 $i ${i/R1/R2}
+done
+# Strange 'val_X' added... to be removed...
+for i in Data/Reads/Trimmed/*val_1*.fq.gz; do
+    mv $i ${i/_val_1/}
+done
+for i in Data/Reads/Trimmed/*val_2*.fq.gz; do
+    mv $i ${i/_val_2/}
+done
+for i in Data/Reads/Trimmed/*_R1_001.fq.gz; do
+  j=${i/R1/R2}
+  mv $i ${i%.fq.gz}_trimmed.fq.gz
+  mv $j ${j%.fq.gz}_trimmed.fq.gz
+done
+
+# from enfer
+for i in *_R1_001.fastq.gz; do
+  echo $i
+  j=${i/R1/R2}
+  ~/Apps/fastp/fastp -y -w 6 -l 20 --adapter_sequence TGGAATTCTCGG --adapter_sequence_r2 GATCGTCGGACT -i $i -I $j -o Data/Reads/Trimmed/$(basename $i .fastq.gz)_trimmed.fq.gz -O Data/Reads/Trimmed/$(basename $j .fastq.gz)_trimmed.fq.gz
+done
+```
+
+Number of reads
+```{bash eval=FALSE}
+for i in Data/Reads/Trimmed/*_R1_001_trimmed.fq.gz; do basename $i _R1_001_trimmed.fq.gz; echo $(($(zcat $i | wc -l) / 4)); done
+```
+IP-body-e15
+  111991819
+IP-brain-adult
+  79076352
+IP-brain-e15
+  127077801
+IP-placenta-e15
+  120645676
+
+Count reads
+```{bash eval=FALSE}
+for i1 in Data/Reads/Trimmed/*_R1_001_trimmed.fq.gz; do
+  basename $i1 _R1_001_trimmed.fq.gz;
+  i2=${i1/R1/R2}
+  j=${i1%R1_001_trimmed.fq.gz}seq.txt
+  paste -d "#" <(zcat $i1) <(zcat $i2) | awk 'NR % 4 == 2' | sort | uniq -c | awk '{print $2 "\t" $1}' > $j
+done
+```
+
+Number of unique sequences
+```{r}
+for i in Data/Reads/Trimmed/*_seq.txt; do wc -l $i; done
+```
+4170199 Data/Reads/Trimmed/IP-body-e15_seq.txt
+7214428 Data/Reads/Trimmed/IP-brain-adult_seq.txt
+2878975 Data/Reads/Trimmed/IP-brain-e15_seq.txt
+3931636 Data/Reads/Trimmed/IP-placenta-e15_seq.txt
+
+
+Merge previous files, filter sequences with less than 2 reads
+(from enfer)
+```{r}
+parseCountFiles <- function(fileName) {
+  fileNameShort <- str_sub(basename(tools::file_path_sans_ext(fileName)), 4, -5)
+  read_tsv(fileName, col_names = c("sequence", "count"), col_types = "ci") %>%
+    mutate(file = fileNameShort)
+}
+countFileNames <- Sys.glob(file.path("Data/Reads/Trimmed", "*_seq.txt"))
+map_dfr(countFileNames, parseCountFiles) %>%
+  pivot_wider(names_from = file, values_from = count, values_fill = 0) %>%
+  mutate(countSum = rowSums(.[2:5])) %>%
+  filter(countSum >= 2) %>%
+  select(-countSum) %>%
+  write_tsv("Data/Reads/Trimmed/counts.tsv")
+```
+
+```{r}
+read_tsv("Data/Reads/Trimmed/counts.tsv", col_types = "ciiii") %>%
+  summarise_if(is.numeric, sum)
+```
+ body-e15 brain-adult brain-e15 placenta-e15
+109101392	73178240	  125206022	   117962730
+
+```{bash eval=FALSE}
+sed '1d' Data/Reads/Trimmed/counts.tsv | tr '#' '\t' | awk '{print "@seq" NR "_" $3 "_" $4 "_" $5 "_" $6 "/1\n" $1 "\n+\n" $1}' | awk '{if (NR % 4 == 0) {l = length($1); for (i = 0; i < l; ++i) {printf("I")} printf("\n")} else {print}}' > Data/Reads/Trimmed/reads_1.fastq
+sed '1d' Data/Reads/Trimmed/counts.tsv | tr '#' '\t' | awk '{print "@seq" NR "_" $3 "_" $4 "_" $5 "_" $6 "/2\n" $2 "\n+\n" $2}' | awk '{if (NR % 4 == 0) {l = length($1); for (i = 0; i < l; ++i) {printf("I")} printf("\n")} else {print}}' > Data/Reads/Trimmed/reads_2.fastq
+```
+
+Append "_1", "_2", etc. if the name is used several times.
+```{bash eval=FALSE}
+for i in snoRDClean snoEnsembl snoRA scaRna rRna mitoRRnaTRna tRrna preMiRna miRnas snRna forgotten
+  do
+  echo $i
+  grep "^>" Data/Annotation/${i}.fa | sort | uniq -c | awk '$1 > 1'
+done
+```
+
+Map the reads to the databases
+```{bash eval=FALSE}
+for i in snoRDClean snoEnsembl snoRA scaRna rRna mitoRRnaTRna tRrna preMiRna miRnas snRna forgotten
+  do
+  ~/Apps/bowtie2/bowtie2-build Data/Annotation/${i}.fa Data/Annotation/${i}
+done
+cp Data/Reads/Trimmed/reads_1.fastq remaining_1.fastq
+cp Data/Reads/Trimmed/reads_2.fastq remaining_2.fastq
+for i in snoRDClean snoRA snoEnsembl scaRna rRna mitoRRnaTRna tRrna preMiRna miRnas snRna forgotten
+  do
+  echo $i
+  ~/Apps/bowtie2/bowtie2 --very-sensitive-local -N 1 -X 5000 --dovetail --no-mixed --no-discordant -p 6 --norc --no-head --soft-clipped-unmapped-tlen -x Data/Annotation/${i} -1 remaining_1.fastq -2 remaining_2.fastq -S out.sam 2> Data/Reads/Mapped/${i}.log
+  rm -f remaining_1.fastq remaining_2.fastq
+  awk 'and($2, 2) == 0' out.sam | awk '{ print "@"$1"\n"$10"\n+\n"$11 > (NR % 2 ? "remaining_1.fastq" : "remaining_2.fastq") }'
+  ~/Apps/bowtie2/bowtie2 --very-sensitive -N 1 -X 5000 --dovetail --no-mixed --no-discordant -p 6 --norc --no-head -x Data/Annotation/${i} -1 remaining_1.fastq -2 remaining_2.fastq -S out1.sam 2> Data/Reads/Mapped/${i}1.log
+  rm -f remaining_1.fastq remaining_2.fastq
+  awk 'and($2, 2) == 0' out1.sam | awk '{ print "@"$1"\n"$10"\n+\n"$11 > (NR % 2 ? "remaining_1.fastq" : "remaining_2.fastq") }'
+  cat out.sam out1.sam | awk 'and($2, 2) == 2'  | awk 'NR % 2 == 1' | awk '{s = ($4 <= $8)? $4: $8; z = $9 < 0? -$9: $9; print $3 "\t" s "\t" (s + z - 1) "\t" $1 "\t.\t+" }'> Data/Reads/Mapped/${i}.bed
+done
+cp remaining_1.fastq remaining_2.fastq Data/Reads/Mapped
+```
+
+Get majority read
+```{r}
+annotations <- c("snoRDClean", "snoRA", "snoEnsembl", "scaRna", "rRna",
+                 "mitoRRnaTRna", "tRrna", "preMiRna", "snRna",
+                 "forgotten")
+findMaj <- function(annotation) {
+  fileName <- paste0("Data/Reads/Mapped/", annotation, ".bed")
+  message(annotation)
+  tmp <- read_tsv(fileName,
+                  col_names = c("seqname", "start", "end", "name", "score", "strand"),
+                  col_types = "ciiccc")
+  if (nrow(tmp) == 0) {
+    return(NULL)
+  }
+  tmp %>%
+    separate(name, c("name", "body-e15", "brain-adult", "brain-e15", "placenta-e15")) %>%
+    mutate(across(c("body-e15", "brain-adult", "brain-e15", "placenta-e15"), as.numeric)) %>%
+    mutate(count = `body-e15` + `brain-adult` + `brain-e15` + `placenta-e15`) %>%
+    mutate(size = end - start) %>%
+    group_by(seqname) %>%
+    arrange(desc(count)) %>%
+    summarise(
+      start              = dplyr::first(start),
+      end                = dplyr::first(end),
+      `body-e15_maj`     = dplyr::first(`body-e15`),
+      `body-e15`         = sum(`body-e15`),
+      `brain-adult_maj`  = dplyr::first(`brain-adult`),
+      `brain-adult`      = sum(`brain-adult`),
+      `brain-e15_maj`    = dplyr::first(`brain-e15`),
+      `brain-e15`        = sum(`brain-e15`),
+      `placenta-e15_maj` = dplyr::first(`placenta-e15`),
+      `placenta-e15`     = sum(`placenta-e15`),
+      min_size           = min(size),
+      max_size           = max(size),
+      size_maj           = dplyr::first(size),
+      .groups   = "drop"
+    ) %>%
+    write_tsv(paste0("Data/Reads/Mapped/", annotation, ".tsv"))
+}
+walk(annotations, findMaj)
+```
+
+Get sequence.
+Note: only the sequenced (as seen by the majority of the reads) part is given as sequence.
+```{r}
+files <- c("forgotten", "mitoRRnaTRna", "preMiRna", "rRna", "scaRna", "snoRA", "snoEnsembl", "snoRDClean", "snRna", "tRrna")
+findSequence <- function(annotation) {
+  message(annotation)
+  fileName      <- paste0("Data/Reads/Mapped/", annotation, ".tsv")
+  table         <- read_tsv(fileName, col_types = "ciiiiiiiiiiiii")
+  fastaFileName <- paste0("Data/Annotation/", annotation, ".fa")
+  dnaData       <- readDNAStringSet(fastaFileName)
+  granges       <- makeGRangesFromDataFrame(table)
+  sequences     <- getSeq(dnaData, granges)
+  table %>%
+    mutate(sequence = as.character(sequences)) %>%
+    mutate(source = annotation, .before = 1)
+}
+map_dfr(files, findSequence) %>%
+  write_tsv("Data/Reads/Mapped/annotated.tsv")
+```
+
+Add box information
+```{r}
+read_tsv("Data/Reads/Mapped/annotated.tsv", col_types = "ccdddddddddddddc") %>%
+  findBestBox(names(cBoxes), cBoxes, TRUE, 5, "C") %>%
+  findBestBox(names(dBoxes), dBoxes, FALSE, 2, "D") %>%
+  findNucleotide() %>%
+  findInterBox() %>%
+  write_tsv("Data/Reads/Mapped/annotatedBox.tsv")
+```
+
+```{r}
+findAllSequences <- function(annotation) {
+  fastaFileName <- paste0("Data/Annotation/", annotation, ".fa")
+  names         <- names(readDNAStringSet(fastaFileName))
+  tibble(source = annotation, seqname = names)
+}
+allSequences <- map_dfr(annotations, findAllSequences) %>%
+  write_tsv("Data/Reads/Mapped/annotated.tsv")
+table <- read_tsv("Data/Reads/Mapped/annotatedBox.tsv")
+left_join(allSequences, table, by = c("source", "seqname")) %>%
+  replace_na(list(`body-e15_maj`     = 0,
+                  `body-e15`         = 0,
+                  `brain-adult_maj`  = 0,
+                  `brain-adult`      = 0,
+                  `brain-e15_maj`    = 0,
+                  `brain-e15`        = 0,
+                  `placenta-e15_maj` = 0,
+                  `placenta-e15`     = 0)) %>%
+  write_tsv("Data/Reads/Mapped/annotatedBoxMissing.tsv")
+```
+```{r}
+read_tsv("Data/Reads/Mapped/annotatedBoxMissing.tsv") %>%
+  summarise(across(c(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`), sum))
+```
+`body-e15` `brain-adult` `brain-e15` `placenta-e15`
+107632257      72266799   124449633      116990234
+
+```{r}
+read_tsv("Data/Reads/Mapped/annotatedBoxMissing.tsv") %>%
+  group_by(source) %>%
+  summarise(across(c(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`), sum), .groups = "drop")
+```
+source       `body-e15` `brain-adult` `brain-e15` `placenta-e15`
+forgotten       1571825       1018616     1675939        3322511
+mitoRRnaTRna     313700       1420142       39990         256195
+preMiRna        5092703       5011680      454445        2178334
+rRna           11108002      10147600     5277375       20902087
+scaRna           133240        190773      210718         266389
+snoEnsembl      2248076       1363906     1302300        4651480
+snoRA             74208         38064       70712          25762
+snoRDClean     80972862      48888991   115253601       82068556
+snRna            124866        114109       50540          97513
+tRrna           5992775       4072918      114013        3221407
+
+```{r}
+read_tsv("Data/Reads/Mapped/annotatedBoxMissing.tsv") %>%
+  mutate("seen_body-e15"     = if_else(`body-e15` > 0, 1, 0)) %>%
+  mutate("seen_brain-adult"  = if_else(`brain-adult` > 0, 1, 0)) %>%
+  mutate("seen_brain-e15"    = if_else(`brain-e15` > 0, 1, 0)) %>%
+  mutate("seen_placenta-e15" = if_else(`placenta-e15` > 0, 1, 0)) %>%
+  group_by(source) %>%
+  summarise("pc_seen_body-e15"     = sum(`seen_body-e15`)     / n(),
+            "pc_seen_brain-adult"  = sum(`seen_brain-adult`)  / n(),
+            "pc_seen_brain-e15"    = sum(`seen_brain-e15`)    / n(),
+            "pc_seen_placenta-e15" = sum(`seen_placenta-e15`) / n())
+```
+source       `pc_seen_body-e15` `pc_seen_brain-adult` `pc_seen_brain-e15` `pc_seen_placenta-e15`
+forgotten                 0.422                 0.4                 0.378                 0.378 
+mitoRRnaTRna              1                     1                   1                     1     
+preMiRna                  0.516                 0.465               0.391                 0.462 
+rRna                      1                     1                   1                     1     
+scaRna                    0.588                 0.569               0.569                 0.549 
+snoEnsembl                0.107                 0.151               0.154                 0.0684
+snoRA                     0.202                 0.194               0.182                 0.183 
+snoRDClean                0.954                 0.948               0.948                 0.948 
+snRna                     0.938                 0.938               0.938                 0.938 
+tRrna                     0.785                 0.806               0.704                 0.777 
+
+Correct snoEnsembl names
+```{r}
+translation <- read_tsv("Data/Annotation/translation.tsv", col_names = c("Gm", "sno"), col_types = "cc")
+read_tsv("Data/Reads/Mapped/annotatedBoxMissing.tsv") %>%
+  left_join(translation, by = c("seqname" = "Gm")) %>%
+  dplyr::mutate(seqname = if_else(is.na(sno), seqname, stringr::str_c(sno, seqname, sep = "_"))) %>%
+  dplyr::select(-sno) %>%
+  dplyr::mutate(size = end - start + 1, .after = end) %>%
+  write_tsv("Data/Reads/Mapped/annotatedBoxMissingClean.tsv")
+```
+
+
+## Map the remaining reads
+```{bash eval=FALSE}
+~/Apps/bowtie2/bowtie2 --very-sensitive -N 1 -X 5000 --dovetail --no-mixed --no-discordant --no-unal -p 6 -x ~/Data/M_musculus/Mus_musculus.GRCm38.dna.simple -1 Data/Reads/Mapped/remaining_1.fastq -2 Data/Reads/Mapped/remaining_2.fastq -S Data/Reads/Mapped/genome.sam 2> Data/Reads/Mapped/genome.log
+~/Apps/samtools-1.10/samtools view -@ 6 -b -o Data/Reads/Mapped/genome.bam Data/Reads/Mapped/genome.sam
+rm -f Data/Reads/Mapped/genome.sam
+~/Apps/bedtools2/bin/bedtools bamtobed -bedpe -i Data/Reads/Mapped/genome.bam | awk '{print $1 "\t" (($2 < $5)? $2: $5) "\t" (($3 > $6)? $3: $6) "\t" $7 "\t.\t" $9}' | awk '($3 - $2 <= 500)' > Data/Reads/Mapped/genome.bed
+```
+
+```{r}
+table <- read_tsv("Data/Reads/Mapped/genome.bed",
+                   col_names = c("seqname", "start", "end", "name", "score", "strand"),
+                   col_types = "fiicff") %>%
+  dplyr::select(-score) %>%
+  tidyr::separate(name, c(NA, "body-e15", "brain-adult", "brain-e15", "placenta-e15")) %>%
+  dplyr::mutate(across(c("body-e15", "brain-adult", "brain-e15", "placenta-e15"), as.integer)) %>%
+  dplyr::mutate(count = `body-e15` + `brain-adult` + `brain-e15` + `placenta-e15`) %>%
+  dplyr::mutate(size = end - start) %>%
+  dplyr::mutate(start = start + 1) %>%
+  arrange(desc(count))
+gr <- makeGRangesFromDataFrame(table)
+mergedGr <- reduce(gr)
+ov <- findOverlaps(mergedGr, gr) %>% as_tibble() %>% arrange(subjectHits)
+table %>%
+  mutate(group = ov$queryHits) %>%
+  group_by(group) %>%
+  arrange(desc(count)) %>%
+  summarise(
+    seqname            = dplyr::first(seqname),
+    start              = dplyr::first(start),
+    end                = dplyr::first(end),
+    strand             = dplyr::first(strand),
+    `body-e15_maj`     = dplyr::first(`body-e15`),
+    `body-e15`         = sum(`body-e15`),
+    `brain-adult_maj`  = dplyr::first(`brain-adult`),
+    `brain-adult`      = sum(`brain-adult`),
+    `brain-e15_maj`    = dplyr::first(`brain-e15`),
+    `brain-e15`        = sum(`brain-e15`),
+    `placenta-e15_maj` = dplyr::first(`placenta-e15`),
+    `placenta-e15`     = sum(`placenta-e15`),
+    min_size           = min(size),
+    max_size           = max(size),
+    size_maj           = dplyr::first(size),
+    .groups   = "drop"
+  ) %>%
+  dplyr::select(-group) %>%
+  write_tsv("Data/Reads/Sequences/merged.tsv")
+```
+
+```{r}
+read_tsv("Data/Reads/Sequences/merged.tsv", guess_max = 1000000) %>%
+  summarise(across(c(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`), sum))
+```
+`body-e15` `brain-adult` `brain-e15` `placenta-e15`
+   1089642        499756      512578         686590
+
+```{r}
+table         <- read_tsv("Data/Reads/Sequences/merged.tsv", guess_max = 1000000)
+fastaFileName <- "~/Data/M_musculus/Mus_musculus.GRCm38.dna.simple.fa"
+dnaData       <- readDNAStringSet(fastaFileName)
+granges       <- makeGRangesFromDataFrame(table)
+sequences     <- getSeq(dnaData, granges)
+sequencesRC   <- reverseComplement(sequences)
+table %>%
+  mutate(sequence = as.character(sequences)) %>%
+  # mutate(sequence = if_else(strand == "+",
+  #                           as.character(sequences),
+  #                           as.character(sequencesRC))) %>%
+  write_tsv("Data/Reads/Sequences/mergedSequence.tsv")
+```
+
+Merge sequence duplicates
+```{r}
+read_tsv("Data/Reads/Sequences/mergedSequence.tsv", guess_max = 1000000) %>%
+  mutate(count = `body-e15` + `brain-adult` + `brain-e15` + `placenta-e15`) %>%
+  group_by(sequence) %>%
+  arrange(desc(count)) %>%
+  summarise(
+    seqname            = dplyr::first(seqname),
+    start              = dplyr::first(start),
+    end                = dplyr::first(end),
+    strand             = dplyr::first(strand),
+    `body-e15_maj`     = dplyr::first(`body-e15_maj`),
+    `body-e15`         = sum(`body-e15`),
+    `brain-adult_maj`  = dplyr::first(`brain-adult_maj`),
+    `brain-adult`      = sum(`brain-adult`),
+    `brain-e15_maj`    = dplyr::first(`brain-e15_maj`),
+    `brain-e15`        = sum(`brain-e15`),
+    `placenta-e15_maj` = dplyr::first(`placenta-e15_maj`),
+    `placenta-e15`     = sum(`placenta-e15`),
+    min_size           = min(min_size),
+    max_size           = max(max_size),
+    size_maj           = dplyr::first(size_maj),
+    .groups   = "drop"
+  ) %>%
+  relocate(sequence, .after = last_col()) %>%
+  write_tsv("Data/Reads/Sequences/mergedSequence2.tsv")
+```
+
+Add box information
+```{r}
+read_tsv("Data/Reads/Sequences/mergedSequence2.tsv") %>%
+  findBestBox(names(cBoxes), cBoxes, TRUE, 5, "C") %>%
+  findBestBox(names(dBoxes), dBoxes, FALSE, 2, "D") %>%
+  findNucleotide() %>%
+  findInterBox() %>%
+  findHelix(fastaFileName, 2) %>%
+  findHelix(fastaFileName, 3) %>%
+  findHelix(fastaFileName, 4) %>%
+  write_tsv("Data/Reads/Sequences/mergedSequenceBox.tsv")
+```
+
+Annotate unseen regions
+```{r}
+table <- read_tsv("Data/Reads/Sequences/mergedSequenceBox.tsv", guess_max = 1000000) %>%
+  dplyr::mutate(ID = row_number())
+gr <- makeGRangesFromDataFrame(table, keep.extra.columns = TRUE)
+annots <- c('mm10_genes_cds', 'mm10_genes_5UTRs', 'mm10_genes_3UTRs', "mm10_genes_introns", "mm10_genes_intergenic", "mm10_lncrna_gencode")
+builtin_annotations()
+annotations <- build_annotations(genome = 'mm10', annotations = annots)
+build_annotations(genome = 'mm10', annotations = "mm10_genes_cds")
+seqlevelsStyle(annotations) <- "Ensembl"
+annotationsTable <- annotate_regions(regions       = gr,
+                                     annotations   = annotations,
+                                     ignore.strand = TRUE,
+                                     quiet         = FALSE) %>%
+  as_tibble() %>%
+  separate(col = "annot.type", into = c(NA, NA, "annot.locus"), sep = "_") %>%
+  mutate(annot.locus = factor(annot.locus)) %>%
+  mutate(annot.locus = fct_recode(annot.locus, "ncRNA" = "gencode")) %>%
+  mutate(annot.locus = fct_relevel(annot.locus, "cds", "ncRNA", "introns", "5UTRs", "3UTRs", "intergenic")) %>%
+  group_by(ID) %>%
+  arrange(annot.locus) %>%
+  summarise(seqnames     = dplyr::first(seqnames),
+            start        = dplyr::first(start),
+            end          = dplyr::first(end),
+            annot.start  = dplyr::first(annot.start),
+            annot.end    = dplyr::first(annot.end),
+            annot.strand = dplyr::first(annot.strand),
+            annot.id     = dplyr::first(annot.id),
+            annot.tx_id  = dplyr::first(annot.tx_id),
+            annot.symbol = dplyr::first(annot.symbol),
+            annot.locus  = dplyr::first(annot.locus),
+            n.annot      = n(),
+            .groups      = "drop") %>%
+  ungroup() %>%
+  mutate(distance_5 = start - annot.start) %>%
+  mutate(distance_3 = annot.end - end) %>%
+  mutate(distance_up   = if_else(annot.strand != "-", distance_5, distance_3)) %>%
+  mutate(distance_down = if_else(annot.strand != "-", distance_3, distance_5)) %>%
+  mutate(annot_size = annot.end - annot.start + 1) %>%
+  mutate(intron_size = if_else(annot.locus == "introns", annot_size, NA_real_)) %>%
+  mutate(dist_acc = if_else(annot.locus == "introns", distance_down, NA_integer_)) %>%
+  dplyr::select(ID, annot.locus, annot.id, annot.tx_id, annot.symbol, annot.strand, intron_size, dist_acc)
+table %>%
+  left_join(annotationsTable, by = "ID") %>%
+  dplyr::select(-c(ID)) %>%
+  write_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotation.tsv")
+```
+
+Add repeat annotation
+```{r}
+table      <- read_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotation.tsv", guess_max = 1000000)
+repeats    <- rtracklayer::import("Data/Annotation/rm.bed", format="bed")
+tableGR    <- makeGRangesFromDataFrame(table)
+overlaps   <- findOverlaps(tableGR, repeats)
+intersects <- width(pintersect(tableGR[queryHits(overlaps)], repeats[subjectHits(overlaps)], ignore.strand=TRUE, strict.strand=FALSE))
+link <- as_tibble(overlaps) %>%
+  mutate(size = intersects) %>%
+  group_by(queryHits) %>%
+  arrange(desc(size)) %>%
+  summarise(subjectHits = dplyr::first(subjectHits))
+table %>%
+  tibble::rowid_to_column("ID") %>%
+  left_join(link, by = c("ID" = "queryHits")) %>%
+  left_join(repeats %>% as_tibble() %>% dplyr::select("name") %>% dplyr::rename("Repeat_name" = name) %>% tibble::rowid_to_column("ID"), by = c("subjectHits" = "ID"), suffix = c("", "_RM")) %>%
+  dplyr::select(-c("ID", "subjectHits")) %>%
+  write_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRM.tsv")
+```
+
+Compare with Michelle
+```{r}
+michelle <- read_tsv("Data/Feat/merged_tissus.tsv") %>%
+  tibble::rowid_to_column("ID")
+michelle %>%
+  dplyr::mutate(ID = str_c(">", ID)) %>%
+  dplyr::select(ID, Sequence) %>%
+  write_delim("Data/Feat/merged_tissus.fa", delim = "\n", col_names = FALSE)
+read_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRM.tsv", guess_max = 1000000) %>%
+  tibble::rowid_to_column("ID") %>%
+  dplyr::mutate(ID = str_c(">", ID)) %>%
+  dplyr::select(ID, sequence) %>%
+  write_delim("Data/Reads/Sequences/mergedSequenceBoxAnnotationRM.fa", delim = "\n", col_names = FALSE)
+```
+
+```{bash eval=FALSE}
+bowtie-build Data/Feat/merged_tissus.fa Data/Feat/merged_tissus
+bowtie -f -v 2 --norc --best --strata -M 1 --no-unal -S --sam-nohead -p 6 Data/Feat/merged_tissus Data/Reads/Sequences/mergedSequenceBoxAnnotationRM.fa Data/Reads/Sequences/michelle.sam
+  # reads processed: 234434
+  # reads with at least one reported alignment: 12655 (5.40%)
+  # reads that failed to align: 220031 (93.86%)
+  # reads with alignments sampled due to -M: 1748 (0.75%)
+  Reported 12655 alignments
+cut -f 1,3 Data/Reads/Sequences/michelle.sam > Data/Reads/Sequences/michelle.tsv
+```
+
+```{r}
+link <- read_tsv("Data/Reads/Sequences/michelle.tsv", col_names = c("myId", "michelleId"))
+michelle <- read_tsv("Data/Feat/merged_tissus.tsv") %>%
+  dplyr::rename("chrs_michelle"  = chrs) %>%
+  dplyr::rename("start_michelle" = start) %>%
+  dplyr::rename("end_michelle"   = end) %>%
+  tibble::rowid_to_column("michelleId")
+read_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRM.tsv", guess_max = 1000000) %>%
+  tibble::rowid_to_column("myId") %>%
+  left_join(link, by = "myId") %>%
+  left_join(michelle, by = "michelleId") %>%
+  dplyr::select(-c("myId", "michelleId")) %>%
+  write_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRMMichelle.tsv")
+```
+
+```{r}
+read_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRMMichelle.tsv", guess_max = 1000000) %>%
+  dplyr::mutate(allCounts = `body-e15` + `brain-adult` + `brain-e15` + `placenta-e15`) %>%
+  dplyr::filter(! is.na(D_box)) %>%
+  dplyr::filter(! is.na(C_box)) %>%
+  arrange(desc(allCounts)) %>%
+  dplyr::select(-allCounts) %>%
+  tibble::rowid_to_column("ID") %>%
+  dplyr::mutate(ID = str_c("MZ_", ID)) %>%
+  dplyr::mutate(size = end - start + 1, .after = end) %>%
+  write_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRMMichelleClean.tsv")
+```
+
+
+## Figures
+
+Load data
+```{r}
+srnaData    <- read_csv("210210_Expressed RNA.csv")
+flSnoData   <- read_csv("210331_SNORD pleine taille_JC modif.csv")
+expSnoData  <- read_csv("210210_Expressed SNORD.csv")
+candSnoData <- read_csv("210120_mergedSequenceBoxAnnotationRMMichelleClean_MZ_SELECT JC.csv", guess_max = 1000000)
+```
+
+Panel 1
+```{r}
+srnaData %>%
+  select(Family, `body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`) %>%
+  group_by(Family) %>%
+  summarise(across(everything(), sum)) %>%
+  pivot_longer(!Family, names_to = "tissue", values_to = "values") %>%
+  group_by(tissue) %>%
+  mutate(values = values / sum(values) * 100) %>%
+  pivot_wider(names_from = "tissue", values_from = "values") %>%
+  write_excel_csv("Figures/panel1.csv")
+```
+
+Panel 2
+```{r}
+nReads <- tibble("tissue" = c("body-e15", "brain-adult", "brain-e15", "placenta-e15"),
+                 "total"  = c(109101392, 73178240, 125206022, 117962730))
+
+expSnoData %>%
+  select(Name, `body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`) %>%
+  group_by(Name) %>%
+  summarise(across(everything(), sum)) %>%
+  pivot_longer(!Name, names_to = "tissue", values_to = "values") %>%
+  left_join(nReads, by = "tissue") %>%
+  mutate(valuesNorm = values / total * 1000000) %>%
+  select(-total) %>%
+  pivot_wider(names_from = "tissue", values_from = c("values", "valuesNorm")) %>%
+  write_excel_csv("Figures/panel2.csv")
+```
+
+Panel 3
+```{r}
+nSnos <- nrow(flSnoData)
+sizeIntervals <- c(seq.int(from = 20, to = 200, by = 20), 100000)
+groupNames    <- tibble(start = sizeIntervals, end = dplyr::lead(start)) %>%
+  mutate(start = if_else(start == 20, 20, start+1)) %>%
+  drop_na() %>%
+  unite(groupName, c(start, end), sep = "-") %>%
+  pull(groupName)
+flSnoData %>%
+  select(size) %>%
+  mutate(group = findInterval(size, sizeIntervals, left.open = TRUE, rightmost.closed = TRUE)) %>%
+  select(-size) %>%
+  group_by(group) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nSnos * 100) %>%
+  mutate(name = groupNames[group], .before = 1) %>%
+  select(-group) %>%
+  write_excel_csv("Figures/panel3.csv")
+```
+
+Panel 4.1
+```{r}
+flSnoData %>%
+  select(`C_box`) %>%
+  replace_na(list(C_box = "none")) %>%
+  group_by(C_box) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nSnos * 100) %>%
+  write_excel_csv("Figures/panel4_1.csv")
+```
+
+Panel 4.2
+```{r}
+flSnoData %>%
+  select(`D_box`) %>%
+  replace_na(list(D_box = "none")) %>%
+  group_by(D_box) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nSnos * 100) %>%
+  write_excel_csv("Figures/panel4_2.csv")
+```
+
+Panel 5
+```{r}
+flSnoData %>%
+  group_by(char_D_box) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nSnos * 100) %>%
+  write_excel_csv("Figures/panel5.csv")
+```
+
+Panel 6.1
+```{r}
+flSnoData %>%
+  group_by(C_pos) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nSnos * 100) %>%
+  write_excel_csv("Figures/panel6_1.csv")
+```
+
+Panel 6.2
+```{r}
+flSnoData %>%
+  group_by(D_pos) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nSnos * 100) %>%
+  write_excel_csv("Figures/panel6_2.csv")
+```
+
+Panel 7.1
+```{r}
+nCandSnoData <- nrow(candSnoData)
+nCandSnoDataSmall <- candSnoData %>% filter(size <= 40) %>% nrow()
+candSnoData %>%
+  select(size) %>%
+  mutate(group = findInterval(size, sizeIntervals, left.open = TRUE, rightmost.closed = TRUE)) %>%
+  select(-size) %>%
+  group_by(group) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoData * 100) %>%
+  mutate(name = groupNames[group], .before = 1) %>%
+  select(-group) %>%
+  write_excel_csv("Figures/panel7_1.csv")
+```
+
+Panel 7.2
+```{r}
+candSnoData %>%
+  select(size) %>%
+  filter(size <= 40) %>%
+  group_by(size) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoDataSmall * 100) %>%
+  write_excel_csv("Figures/panel7_2.csv")
+```
+
+Panel 7.3
+```{r}
+candSnoData %>%
+  mutate(group = findInterval(size, sizeIntervals, left.open = TRUE, rightmost.closed = TRUE)) %>%
+  mutate(firstNt = str_sub(sequence, 1, 1)) %>%
+  group_by(group, firstNt) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / sum(percent) * 100) %>%
+  ungroup() %>%
+  pivot_wider(names_from = "firstNt", values_from = "percent") %>%
+  write_excel_csv("Figures/panel7_3.csv")
+```
+
+Panel 7.4
+```{r}
+candSnoData %>%
+  filter(size <= 40) %>%
+  mutate(firstNt = str_sub(sequence, 1, 1)) %>%
+  group_by(size, firstNt) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / sum(percent) * 100) %>%
+  ungroup() %>%
+  pivot_wider(names_from = "firstNt", values_from = "percent") %>%
+  write_excel_csv("Figures/panel7_4.csv")
+```
+
+Panel 8.1
+```{r}
+candSnoData %>%
+  select(`C_box`) %>%
+  group_by(C_box) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoData * 100) %>%
+  write_excel_csv("Figures/panel8_1.csv")
+```
+
+Panel 8.2
+```{r}
+candSnoData %>%
+  select(`D_box`) %>%
+  replace_na(list(D_box = "none")) %>%
+  group_by(D_box) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoData * 100) %>%
+  write_excel_csv("Figures/panel8_2.csv")
+```
+
+Panel 8.3
+```{r}
+candSnoData %>%
+  filter(size <= 40) %>%
+  select(`C_box`) %>%
+  group_by(C_box) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoDataSmall * 100) %>%
+  write_excel_csv("Figures/panel8_3.csv")
+```
+
+Panel 8.4
+```{r}
+candSnoData %>%
+  filter(size <= 40) %>%
+  select(`D_box`) %>%
+  replace_na(list(D_box = "none")) %>%
+  group_by(D_box) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoDataSmall * 100) %>%
+  write_excel_csv("Figures/panel8_4.csv")
+```
+
+Panel 9.1
+```{r}
+candSnoData %>%
+  group_by(char_D_box) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoData * 100) %>%
+  write_excel_csv("Figures/panel9_1.csv")
+```
+
+Panel 9.2
+```{r}
+candSnoData %>%
+  filter(size <= 40) %>%
+  group_by(char_D_box) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoDataSmall * 100) %>%
+  write_excel_csv("Figures/panel9_2.csv")
+```
+
+Panel 10.1
+```{r}
+candSnoData %>%
+  group_by(C_pos) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoData * 100) %>%
+  write_excel_csv("Figures/panel10_1.csv")
+```
+
+Panel 10.2
+```{r}
+candSnoData %>%
+  group_by(D_pos) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoData * 100) %>%
+  write_excel_csv("Figures/panel10_2.csv")
+```
+
+Panel 10.3
+```{r}
+candSnoData %>%
+  filter(size <= 40) %>%
+  group_by(C_pos) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoDataSmall * 100) %>%
+  write_excel_csv("Figures/panel10_3.csv")
+```
+
+Panel 10.4
+```{r}
+candSnoData %>%
+  filter(size <= 40) %>%
+  group_by(D_pos) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoDataSmall * 100) %>%
+  write_excel_csv("Figures/panel10_4.csv")
+```
+
+Panel 11.1
+```{r}
+candSnoData %>%
+  replace_na(list(annot.locus = "intergenic")) %>%
+  group_by(annot.locus) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoData * 100) %>%
+  write_excel_csv("Figures/panel11_1.csv")
+```
+
+Panel 11.2
+```{r}
+candSnoData %>%
+  replace_na(list(annot.locus = "intergenic")) %>%
+  filter(size <= 40) %>%
+  group_by(annot.locus) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoDataSmall * 100) %>%
+  write_excel_csv("Figures/panel11_2.csv")
+```
+
+Panel 12.1
+```{r}
+candSnoData %>%
+  replace_na(list(Repeat_name = "no")) %>%
+  group_by(Repeat_name) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoData * 100) %>%
+  write_excel_csv("Figures/panel12_1.csv")
+```
+
+Panel 12.2
+```{r}
+candSnoData %>%
+  filter(size <= 40) %>%
+  replace_na(list(Repeat_name = "no")) %>%
+  group_by(Repeat_name) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoDataSmall * 100) %>%
+  write_excel_csv("Figures/panel12_2.csv")
+```
+
+Panel 13.1
+```{r}
+candSnoData %>%
+  mutate(distance = case_when(
+    is.na(dist_acc) ~ "no",
+    dist_acc < 200 ~ "< 200",
+    dist_acc >= 200 ~ ">= 200")) %>%
+  group_by(distance) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoData * 100) %>%
+  write_excel_csv("Figures/panel13_1.csv")
+```
+
+Panel 13.2
+```{r}
+candSnoData %>%
+  filter(size <= 40) %>%
+  mutate(distance = case_when(
+    is.na(dist_acc) ~ "no",
+    dist_acc < 200 ~ "< 200",
+    dist_acc >= 200 ~ ">= 200")) %>%
+  group_by(distance) %>%
+  summarise(percent = n()) %>%
+  mutate(percent = percent / nCandSnoDataSmall * 100) %>%
+  write_excel_csv("Figures/panel13_2.csv")
+```
+
+Panel 14.1
+```{r}
+candSnoData %>%
+  select(starts_with("isHarpin")) %>%
+  mutate(across(everything(), ~ if_else(.x, 1, 0))) %>%
+  summarize(across(everything(), sum)) %>%
+  mutate(across(everything(), ~ .x / nCandSnoData * 100)) %>%
+  write_excel_csv("Figures/panel14_1.csv")
+```
+  
+Panel 14.2
+```{r}
+candSnoData %>%
+  filter(size <= 40) %>%
+  select(starts_with("isHarpin")) %>%
+  mutate(across(everything(), ~ if_else(.x, 1, 0))) %>%
+  summarize(across(everything(), sum)) %>%
+  mutate(across(everything(), ~ .x / nCandSnoDataSmall * 100)) %>%
+  write_excel_csv("Figures/panel14_2.csv")
+```
+
+Panel 15.1
+```{r}
+tmp <- candSnoData %>%
+  select(ID, `body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`, `isHarpin_2`, `isHarpin_3`, `isHarpin_4`) %>%
+  mutate(across(starts_with("isHarpin"), ~ if_else(.x, 1, 0))) %>%
+  pivot_longer(!ID, names_to = "names", values_to = "values") %>%
+  left_join(nReads, by = c(names = "tissue")) %>%
+  mutate(valuesNorm = values / total * 1000000) %>%
+  mutate(valuesNorm = coalesce(valuesNorm, values)) %>%
+  select(-c(values, total)) %>%
+  pivot_wider(names_from = "names", values_from = "valuesNorm") %>%
+  mutate(mean_exp = rowMeans(select(., c(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`)), na.rm = TRUE)) %>%
+  filter(mean_exp >= 5)
+tmp %>%
+  select(starts_with("isHarpin")) %>%
+  summarize(across(everything(), sum)) %>%
+  mutate(across(everything(), ~ .x / nrow(tmp) * 100)) %>%
+  write_excel_csv("Figures/panel15_1.csv")
+```
+Only 25 candidates!
+
+Panel 15.2
+```{r}
+tmp <- candSnoData %>%
+  filter(size <= 40) %>%
+  select(ID, `body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`, `isHarpin_2`, `isHarpin_3`, `isHarpin_4`) %>%
+  mutate(across(starts_with("isHarpin"), ~ if_else(.x, 1, 0))) %>%
+  pivot_longer(!ID, names_to = "names", values_to = "values") %>%
+  left_join(nReads, by = c(names = "tissue")) %>%
+  mutate(valuesNorm = values / total * 1000000) %>%
+  mutate(valuesNorm = coalesce(valuesNorm, values)) %>%
+  select(-c(values, total)) %>%
+  pivot_wider(names_from = "names", values_from = "valuesNorm") %>%
+  mutate(mean_exp = rowMeans(select(., c(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`)), na.rm = TRUE)) %>%
+  filter(mean_exp >= 5)
+tmp %>%
+  select(starts_with("isHarpin")) %>%
+  summarize(across(everything(), sum)) %>%
+  mutate(across(everything(), ~ .x / nrow(tmp) * 100)) %>%
+  write_excel_csv("Figures/panel15_2.csv")
+```
+Only 9 candidates!
+
+Panel 16
+```{bash}
+sed '1d' "210210_SNORD pleine taille.csv" | cut -f 19 -d"," | awk '{print ">sno_" NR "\n" $1}' > Figures/fullLength.fa
+~/Apps/bowtie2/bowtie2 -f -x Mus_musculus.GRCm38.dna.simple Figures/fullLength.fa | ~/Apps/samtools-1.10/samtools view -bS - | ~/Apps/bedtools2/bin/bedtools bamtobed > Figures/fullLength.bed
+for i in Data/Reads/Trimmed/*_R1_001_trimmed.fq.gz; do echo $i; ~/Apps/bowtie2/bowtie2 --very-sensitive-local -N 1 -X 5000 --dovetail --no-mixed --no-discordant -p 12 --soft-clipped-unmapped-tlen --no-unal --un-conc-gz Figures/$(basename $i _R1_001_trimmed.fq.gz) -x Mus_musculus.GRCm38.dna.simple -1 $i -2 ${i/R1/R2} -S Figures/$(basename $i _R1_001_trimmed.fq.gz).sam; done
+for i in Figures/*[12]; do mv $i $i.fq.gz; done
+for i in Figures/*.1.fq.gz; do echo $i; ~/Apps/bowtie2/bowtie2 --very-sensitive -N 1 -X 5000 --dovetail --no-mixed --no-discordant -p 12 --no-unal -x Mus_musculus.GRCm38.dna.simple -1 $i -2 ${i/.1./.2.} -S Figures/$(basename $i .1.fq.gz)_local.sam; done
+for i in Figures/*.sam; do ~/Apps/samtools-1.10/samtools view -@ 3 -b -o ${i%sam}bam $i; done
+cd Figures
+for i in IP-body-e15 IP-brain-adult IP-brain-e15 IP-placenta-e15; do ~/Apps/samtools-1.10/samtools merge ${i}_all.bam ${i}.bam ${i}_local.bam; done
+cd ..
+for i in Figures/*_all.bam; do ~/Apps/samtools-1.10/samtools sort -o ${i%_all.bam}_sorted.bam -@ 5 $i; done
+for i in Figures/*_sorted.bam; do ~/Apps/samtools-1.10/samtools index -@ 3 $i; done
+for i in Figures/*_sorted.bam; do ~/Apps/deepTools/bin/bamCoverage --bam $i -o ${i%bam}bw --binSize 1 --normalizeUsing CPM --effectiveGenomeSize 2620345972 -p 12; done
+/Apps/deepTools/bin/computeMatrix scale-regions -S Figures/*.bw -R Figures/fullLength.bed -o Figures/matrice.mat -m 100 --startLabel "5'" --endLabel "3'" -b 10 -a 10 -bs 1 --skipZeros --smartLabels -p 6
+/Apps/deepTools/bin/computeMatrix reference-point -S Figures/*.bw -R Figures/fullLength.bed -o Figures/matrice5.mat --referencePoint TSS -b 10 -a 10 -bs 1 --skipZeros --smartLabels -p 6
+/Apps/deepTools/bin/computeMatrix reference-point -S Figures/*.bw -R Figures/fullLength.bed -o Figures/matrice3.mat --referencePoint TES -b 10 -a 10 -bs 1 --skipZeros --smartLabels -p 6
+/Apps/deepTools/bin/plotProfile -m Figures/matrice.mat --startLabel "5'" --endLabel "3'" -o Figures/panel16.png --averageType media
+/Apps/deepTools/bin/plotProfile -m Figures/matrice5.mat --refPointLabel "5'" -o Figures/panel16_1.png --averageType median --yMax 50
+/Apps/deepTools/bin/plotProfile -m Figures/matrice3.mat --refPointLabel "3'" -o Figures/panel16_2.png --averageType median --yMax 50
+```
+
+Panel 17
+```{r}
+p <- bind_rows(flSnoData   %>%                        select(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`) %>% mutate(source = "known"),
+          candSnoData %>%                        select(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`) %>% mutate(source = "candidates"),
+          candSnoData %>% filter(size <= 40) %>% select(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`) %>% mutate(source = "candidates_small")) %>%
+  mutate(source = factor(source, levels = c("known", "candidates", "candidates_small"))) %>%
+  pivot_longer(!source, names_to = "tissue", values_to = "count") %>%
+  left_join(nReads, by = "tissue") %>%
+  mutate(CPM = count / total * 1000000) %>%
+  ggplot(aes(CPM)) + geom_histogram() + facet_grid(rows = vars(source)) + scale_x_log10()
+expressionIntervals <- ggplot_build(p)$data[[1]] %>%
+  as_tibble() %>%
+  mutate(xmin = 10 ^ xmin) %>%
+  pull(xmin) %>%
+  head(30)
+expressionIntervals[[1]] <- 0
+expressionIntervalsNames <- ggplot_build(p)$data[[1]] %>%
+  as_tibble() %>%
+  mutate(xmin = 10 ^ xmin) %>%
+  mutate(xmax = 10 ^ xmax) %>%
+  select(xmin, xmax)
+expressionIntervalsNames[1, 1] <- 0.0
+expressionIntervalsNames <- expressionIntervalsNames %>%
+  unite(groupName, c(xmin, xmax), sep = "-") %>%
+  pull(groupName) %>%
+  head(30) %>%
+  factor(., levels = .)
+emptyValues <- expand_grid(tissue = c("body-e15", "brain-adult", "brain-e15", "placenta-e15"), CPM_interval = 1:30)
+```
+
+Panel 17.1
+```{r}
+flSnoData %>%
+  select(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`) %>%
+  pivot_longer(everything(), names_to = "tissue", values_to = "count") %>%
+  left_join(nReads, by = "tissue") %>%
+  mutate(CPM = count / total * 1000000) %>%
+  mutate(CPM_interval = findInterval(CPM, expressionIntervals)) %>%
+  group_by(tissue, CPM_interval) %>%
+  summarise(percent = n() / nrow(flSnoData) * 100, .groups = "drop_last") %>%
+  ungroup() %>%
+  right_join(emptyValues) %>%
+  replace_na(list(percent = 0.0)) %>%
+  mutate(CPM = expressionIntervalsNames[CPM_interval]) %>%
+  select(tissue, CPM, percent) %>%
+  pivot_wider(names_from = CPM, values_from = percent) %>%
+  select(c("tissue", expressionIntervalsNames)) %>%
+  write_excel_csv("Figures/panel17_1.csv")
+```
+
+Panel 17.2
+```{r}
+candSnoData %>%
+  select(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`) %>%
+  pivot_longer(everything(), names_to = "tissue", values_to = "count") %>%
+  left_join(nReads, by = "tissue") %>%
+  mutate(CPM = count / total * 1000000) %>%
+  mutate(CPM_interval = findInterval(CPM, expressionIntervals)) %>%
+  group_by(tissue, CPM_interval) %>%
+  summarise(percent = n() / nrow(candSnoData) * 100, .groups = "drop_last") %>%
+  ungroup() %>%
+  right_join(emptyValues) %>%
+  replace_na(list(percent = 0.0)) %>%
+  mutate(CPM = expressionIntervalsNames[CPM_interval]) %>%
+  select(tissue, CPM, percent) %>%
+  pivot_wider(names_from = CPM, values_from = percent) %>%
+  select(c("tissue", expressionIntervalsNames)) %>%
+  write_excel_csv("Figures/panel17_2.csv")
+```
+
+```{r}
+candSnoData %>%
+  filter(size <= 40) %>%
+  select(`body-e15`, `brain-adult`, `brain-e15`, `placenta-e15`) %>%
+  pivot_longer(everything(), names_to = "tissue", values_to = "count") %>%
+  left_join(nReads, by = "tissue") %>%
+  mutate(CPM = count / total * 1000000) %>%
+  mutate(CPM_interval = findInterval(CPM, expressionIntervals)) %>%
+  group_by(tissue, CPM_interval) %>%
+  summarise(percent = n() / nrow(candSnoData %>% filter(size <= 40)) * 100, .groups = "drop_last") %>%
+  ungroup() %>%
+  right_join(emptyValues) %>%
+  replace_na(list(percent = 0.0)) %>%
+  mutate(CPM = expressionIntervalsNames[CPM_interval]) %>%
+  select(tissue, CPM, percent) %>%
+  pivot_wider(names_from = CPM, values_from = percent) %>%
+  select(c("tissue", expressionIntervalsNames)) %>%
+  write_excel_csv("Figures/panel17_3.csv")
+```
+
+
+# Project 1
+
+```{r}
+snorna <- read_csv("Snord Candidates for piRNA search.csv")
+snorna %>%
+  select(ID, sequence) %>%
+  mutate(ID = str_c(">", ID)) %>%
+  write_delim("Snord Candidates for piRNA search.fa", delim = "\n", col_names = FALSE, quote_escape = FALSE)
+```
+
+```{bash}
+~/Apps/bowtie2/bowtie2 -f --very-sensitive-local -N 1 -X 5000 -p 6 --norc --soft-clipped-unmapped-tlen -x Data/Annotation/piRna -U Snord\ Candidates\ for\ piRNA\ search.fa -S out.sam
+grep -v '^@' out.sam | awk 'and($2, 2) == 0' | awk '{ print "@"$1"\n"$10"\n+\n"$11 }' > remaining.fastq
+~/Apps/bowtie2/bowtie2 --very-sensitive -N 1 -X 5000 -p 6 --norc --no-head -x Data/Annotation/piRna -U remaining.fastq -S out1.sam
+cat out.sam out1.sam > outAll.sam
+~/Apps/samtools-1.10/samtools view -b -o outAll.bam outAll.sam
+~/Apps/Bedtools/bin/bedtools bamtobed -i outAll.bam -ed > Data/Reads/Mapped/piRNA.bed
+rm out*
+```
+
+Get number of sequences, and size distribution, of the piRNAs
+```{r}
+piRnas <- readDNAStringSet("Data/Annotation/piRna.fa")
+length(piRnas)
+p <- width(piRnas) %>% as_tibble() %>% dplyr::rename(size = value) %>% ggplot(aes(x = size)) + geom_histogram(binwidth = 1)
+ggsave("Data/Annotation/piRnaSize.png", p)
+```
+  68054594
+
+```{bash}
+cp Data/Annotation/piRna.fa tmp.fa
+for i in snoRDClean snoRA snoEnsembl scaRna rRna mitoRRnaTRna tRrna preMiRna miRnas snRna forgotten                                                                                                                
+  do                                                                                                                                                                                                               
+  echo $i                                                                                                                                                                                                          
+  ~/Apps/bowtie2/bowtie2 -f --very-sensitive-local -N 1 -X 5000 -p 6 -x Data/Annotation/${i} tmp.fa --un tmp2.fa -S /dev/null
+  mv -f tmp2.fa tmp.fa
+done                                                                                                                                                                                                               
+mv tmp.fa Data/Annotation/piRnaNoSmall.fa
+```
+
+```{r}
+readDNAStringSet("Data/Annotation/piRnaNoSmall.fa") %>%
+  as.data.frame() %>%
+  as_tibble(rownames = "name") %>%
+  rename(sequence = x) %>%
+  mutate(piWidth = str_length(sequence)) %>%
+  findBestBox(names(cBoxes), cBoxes, TRUE, 5, "C") %>%
+  findBestBox(names(dBoxes), dBoxes, FALSE, 2, "D") %>%
+  findNucleotide() %>%
+  findInterBox() %>%
+  write_tsv("Data/Annotation/piRnaBox.tsv")
+```
+
+
+```{r}
+piRnaBed <- read_tsv("Data/Reads/Mapped/piRNA.bed", col_names = c("piID", "piStart", "piEnd", "snoID", "NM", "piStrand")) %>%
+  mutate(width = piEnd - piStart) %>%
+  select(-c("NM", "piStrand"))
+piRnaFa <- readDNAStringSet("Data/Annotation/piRnaNoSmall.fa") %>%
+  as.data.frame() %>%
+  as_tibble(rownames = "name") %>%
+  dplyr::rename(sequence = x) %>%
+  mutate(piWidth = str_length(sequence))
+piRnaLoci <- read_tsv("Data/Annotation/mmu.bed.gz", col_names = c("piChr", "piStart", "piEnd", "piID", "piScore", "piStrand")) %>% select(-piScore)
+snorna %>%
+  left_join(piRnaBed, by = c("ID" = "snoID")) %>%
+  dplyr::rename(snoWidth = size) %>%
+  select(ID, snoWidth, piID, width) %>%
+  group_by(ID) %>%
+  slice_max(with, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  left_join(piRnaFa, by = c("piID" = "name")) %>%
+  dplyr::rename(piSequence = sequence) %>%
+  filter(pmin(snoWidth, piWidth) >= 0.8 * width) %>%
+  right_join(snorna, by = "ID") %>%
+  left_join(piRnaLoci, by = "piID") %>%
+  select(-c("snoWidth", "width", "piWidth")) %>%
+  mutate(piChr    = if_else(is.na(piSequence), NA_character_, piChr)) %>%
+  mutate(piStart  = if_else(is.na(piSequence), NA_real_, piStart)) %>%
+  mutate(piEnd    = if_else(is.na(piSequence), NA_real_, piEnd)) %>%
+  mutate(piStrand = if_else(is.na(piSequence), NA_character_, piStrand)) %>%
+  mutate(piSize   = str_length(piSequence)) %>%
+  mutate(piMatch  = if_else(sequence == piSequence, "full", "partial")) %>%
+  mutate(piSizeDiff = abs(size - piSize)) %>%
+  group_by(ID) %>%
+  mutate(nPi = n()) %>%
+  slice_min(piSizeDiff, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(-piSizeDiff) %>%
+  mutate(nPi = if_else(is.na(piSequence), as.integer(0), nPi)) %>%
+  mutate(ID = as.integer(str_sub(ID, 4))) %>%
+  arrange(ID) %>%
+  mutate(ID = str_c("MZ_", as.character(ID))) %>%
+  write_excel_csv("project1.csv")
+```
+
+```{bash}
+for i in GSM822760 GSM822758 GSM822759 GSM475280; do fasterq-dump -O Data/OtherReads $i; done
+for i in SRR014232 SRR014233; do fasterq-dump -O Data/OtherReads $i; done
+mv Data/OtherReads/SRR014232.fastq Data/OtherReads/GSM319956.fastq
+mv Data/OtherReads/SRR014233.fastq Data/OtherReads/GSM319957.fastq
+for i in Data/OtherReads/GSM*.fastq
+  do
+  ~/Apps/bowtie2/bowtie2 --very-sensitive-local -N 1 -X 5000 -p 6 --norc --no-head --no-unal -x "Snord Candidates for piRNA search" $i | cut -f 3 | sort | uniq -c | awk '{print $2 "," $1}' > ${i%fastq}txt
+done
+```
+
+Trim reads
+```{bash eval=FALSE}
+for i in GSM319956.fastq GSM319957.fastq; do
+    trim_galore --stringency 5 -a CTGTAGGCACCATCAATCGTATGCCGTCTTCTGCTT $i
+done
+for i in GSM475280.fastq GSM822758.fastq GSM822759.fastq GSM822760.fastq; do
+    trim_galore --stringency 5 -a TCGTATGCCGTCTTCTGCTTG $i
+done
+```
+
+Number of unique sequences
+```{bash}
+for i in Data/OtherReads/GSM*_trimmed.fq
+  do
+  echo $i
+  awk '(NR % 4 == 2)' $i | sort | uniq | wc -l
+done
+```
+
+```{r}
+getSizeDistribution <- function(fileName) {
+  readDNAStringSet(fileName, format="fastq") %>% width() %>% as_tibble() %>% dplyr::rename(size = value) %>% mutate(source = basename(tools::file_path_sans_ext(fileName))) %>% tidyr::separate(source, c("source", NA), sep = "_")
+}
+p <- purrr::map_dfr(Sys.glob(file.path("Data/OtherReads", "GSM*_trimmed.fq")), getSizeDistribution) %>% mutate(source = factor(source)) %>% ggplot(aes(x = size, color = source)) + geom_freqpoly(binwidth = 1)
+ggsave("Data/Annotation/piRnaSizeSequencing.png", p)
+```
+
+```{r}
+countNLines <- function(fileName) {
+  tibble(n = length(read_lines(fileName)) / 4)
+}
+parseOtherReadsFiles <- function(fileName) {
+  read_csv(fileName, col_names = c("ID", "count"), col_types = "ci", trim_ws = TRUE) %>%
+    mutate(file = basename(tools::file_path_sans_ext(fileName)))
+}                                                                                                                                                                                                                  
+countFileNames <- Sys.glob(file.path("Data/OtherReads", "GSM*.txt"))                                                                                                                                           
+rawFileNames <- Sys.glob(file.path("Data/OtherReads", "GSM*.fastq"))
+nLinesOtherReadsFiles <- map_dfr(rawFileNames, countNLines, .id = "fileName") %>%
+  mutate(fileName = basename(tools::file_path_sans_ext(rawFileNames[as.integer(fileName)])))
+nLinesOtherReadsFiles <- map_dfr(rawFileNames, countNLines, .id = "fileName")
+read_csv("project1.csv") %>%
+  left_join(map_dfr(countFileNames, parseOtherReadsFiles) %>%
+              left_join(nLinesOtherReadsFiles, by = c(file = "fileName")) %>%
+              mutate(count = count / n * 1000000) %>%
+              select(- n) %>%
+              pivot_wider(names_from = file, values_from = count, values_fill = 0),
+            by = "ID") %>%
+  replace_na(list(GSM319956 = 0, GSM475280 = 0, GSM822759 = 0, GSM319957 = 0, GSM822758 = 0, GSM822760 = 0)) %>%
+  write_excel_csv("project2.csv")
+```
+
+```{bash}
+for i in GSM1067865 GSM2285583 GSM2042733; do fasterq-dump -O Data/HumanReads $i; done
+wget http://snoatlas.bioinf.uni-leipzig.de/fastas.tar.gz
+tar xvzf fastas.tar.gz
+cat snoID_* RF0* | paste - - | grep sapiens | sed 's/\t/\n/g' > Data/Annotation/Human/snoAtlas.fa
+cat Data/Annotation/Human/miRna.fa Data/Annotation/Human/mitoRna.fa Data/Annotation/Human/premiRna.fa Data/Annotation/Human/rRna.fa Data/Annotation/Human/scaRna.fa Data/Annotation/Human/snoAtlas.fa Data/Annotation/Human/snoRa.fa Data/Annotation/Human/snoRd.fa Data/Annotation/Human/snRna.fa Data/Annotation/Human/tRna.fa > Data/Annotation/Human/all.fa
+~/Apps/bowtie2/bowtie2-build Data/Annotation/Human/all.fa Data/Annotation/Human/all
+for gsm in GSM1067865 GSM2285583 GSM2042733
+  do
+  ~/Apps/bowtie2/bowtie2 --very-sensitive-local -N 1 -X 5000 -p 6 -x Data/Annotation/Human/all Data/HumanReads/${gsm}.fastq --un Data/HumanReads/${gsm}_noKnown.fastq -S /dev/null
+done
+for gsm in GSM1067865 GSM2285583 GSM2042733
+  do
+  ~/Apps/bowtie2/bowtie2 --very-sensitive -N 1 -X 5000 --no-unal -p 6 -x ~/Data/H_sapiens/Homo_sapiens.GRCh38.dna.primary_assembly -U Data/HumanReads/${gsm}_noKnown.fastq -S Data/HumanReads/${gsm}.sam
+  ~/Apps/samtools-1.10/samtools view -@ 6 -b -o Data/HumanReads/${gsm}.bam Data/HumanReads/${gsm}.sam
+  rm -f Data/HumanReads/${gsm}.sam
+  bedtools bamtobed -i Data/HumanReads/${gsm}.bam > Data/Reads/Mapped/${gsm}.bed
+done
+```
+
+```{r}
+readBedFile <- function(fileName) {
+  read_tsv(fileName,
+           col_names = c("seqname", "start", "end", "name", "score", "strand"),                                                                                                                            
+           col_types = "fiicff") %>%
+    dplyr::select(-c("name", "score")) %>%
+    group_by(seqname, start, end, strand) %>%
+    mutate(start = start + 1) %>%
+    summarise(count = n(), .groups = "drop") %>%
+    mutate(fileName = basename(tools::file_path_sans_ext(fileName)))
+}
+table <- map_dfr(Sys.glob(file.path("Data/HumanReads/", "GSM*.bed")), readBedFile) %>%
+  pivot_wider(names_from = "fileName", values_from = "count", values_fill = 0) %>%
+  mutate(allCount = GSM1067865 + GSM2042733 + GSM2285583)
+gr <- makeGRangesFromDataFrame(table)
+mergedGr <- GenomicRanges::reduce(gr)
+ov <- findOverlaps(mergedGr, gr) %>% as_tibble() %>% arrange(subjectHits)
+table %>%
+  mutate(size = end - start + 1) %>%
+  mutate(group = ov$queryHits) %>%
+  group_by(group) %>%
+  arrange(desc(allCount), .by_group = TRUE) %>%
+  summarise(
+    seqname            = dplyr::first(seqname),
+    start              = dplyr::first(start),
+    end                = dplyr::first(end),
+    strand             = dplyr::first(strand),
+    `GSM1067865_maj`   = dplyr::first(`GSM1067865`),
+    `GSM1067865`       = sum(`GSM1067865`),
+    `GSM2042733_maj`   = dplyr::first(`GSM2042733`),
+    `GSM2042733`       = sum(`GSM2042733`),
+    `GSM2285583_maj`   = dplyr::first(`GSM2285583`),
+    `GSM2285583`       = sum(`GSM2285583`),
+    min_size           = min(size),
+    max_size           = max(size),
+    size_maj           = dplyr::first(size),
+    .groups            = "drop"
+  ) %>%
+  write_tsv("Data/HumanReads/merged.tsv")
+```
+
+```{r}
+read_tsv("Data/HumanReads/merged.tsv", guess_max = 1000000) %>%
+  summarise(across(c(`GSM1067865`, `GSM2042733`, `GSM2285583`), sum))
+```
+GSM1067865 GSM2042733 GSM2285583
+   4464456     795030     653610
+
+```{r}
+table         <- read_tsv("Data/HumanReads/merged.tsv", guess_max = 1000000)
+fastaFileName <- "~/Data/H_sapiens/Homo_sapiens.GRCh38.dna.primary_assembly_simple.fa"
+dnaData       <- readDNAStringSet(fastaFileName)
+granges       <- makeGRangesFromDataFrame(table)
+sequences     <- getSeq(dnaData, granges)
+table %>%
+  mutate(sequence = as.character(sequences)) %>%
+  write_tsv("Data/HumanReads/mergedSequence.tsv")
+```
+
+```{r}
+read_tsv("Data/HumanReads/mergedSequence.tsv", guess_max = 1000000) %>%
+  mutate(count = `GSM1067865` + `GSM2042733` + `GSM2285583`) %>%
+  group_by(sequence) %>%
+  arrange(desc(count), by_group = TRUE) %>%
+  summarise(
+    seqname            = dplyr::first(seqname),
+    start              = dplyr::first(start),
+    end                = dplyr::first(end),
+    strand             = dplyr::first(strand),
+    `GSM1067865_maj`   = dplyr::first(`GSM1067865_maj`),
+    `GSM1067865`       = sum(`GSM1067865`),
+    `GSM2042733_maj`   = dplyr::first(`GSM2042733_maj`),
+    `GSM2042733`       = sum(`GSM2042733`),
+    `GSM2285583_maj`   = dplyr::first(`GSM2285583_maj`),
+    `GSM2285583`       = sum(`GSM2285583`),
+    min_size           = min(min_size),
+    max_size           = max(max_size),
+    size_maj           = dplyr::first(size_maj),
+    .groups            = "drop"
+  ) %>%
+  relocate(sequence, .after = last_col()) %>%
+  write_tsv("Data/HumanReads/mergedSequence2.tsv")
+```
+
+Add box information
+```{r}
+read_tsv("Data/HumanReads/mergedSequence2.tsv", guess_max = 10000) %>%
+  findBestBox(names(cBoxes), cBoxes, TRUE, 5, "C") %>%
+  findBestBox(names(dBoxes), dBoxes, FALSE, 2, "D") %>%
+  findNucleotide() %>%
+  findInterBox() %>%
+  dplyr::mutate(allCounts = `GSM1067865` + `GSM2042733` + `GSM2285583`) %>%
+  dplyr::filter(! is.na(D_box)) %>%
+  dplyr::filter(! is.na(C_box)) %>%
+  findHelix(fastaFileName, 2) %>%
+  findHelix(fastaFileName, 3) %>%
+  findHelix(fastaFileName, 4) %>%
+  arrange(desc(allCounts)) %>%
+  dplyr::select(-allCounts) %>%
+  dplyr::mutate(size = end - start + 1, .after = end) %>%
+  write_tsv("Data/HumanReads/annotatedBox.tsv")
+```                                                                                                                                                                                                                
+
+Annotate unseen regions
+```{r}
+table <- read_tsv("Data/HumanReads/annotatedBox.tsv", guess_max = 1000000) %>%
+  dplyr::mutate(ID = row_number())
+gr <- makeGRangesFromDataFrame(table, keep.extra.columns = TRUE)
+annots <- c('hg38_genes_cds', 'hg38_genes_5UTRs', 'hg38_genes_3UTRs', "hg38_genes_introns", "hg38_genes_intergenic", "hg38_lncrna_gencode")
+builtin_annotations()
+annotations <- build_annotations(genome = 'hg38', annotations = annots)
+seqlevelsStyle(annotations) <- "Ensembl"
+annotationsTable <- annotate_regions(regions       = gr,
+                                     annotations   = annotations,
+                                     ignore.strand = TRUE,
+                                     quiet         = FALSE) %>%
+  as_tibble() %>%
+  separate(col = "annot.type", into = c(NA, NA, "annot.locus"), sep = "_") %>%
+  mutate(annot.locus = factor(annot.locus)) %>%
+  mutate(annot.locus = fct_recode(annot.locus, "ncRNA" = "gencode")) %>%
+  mutate(annot.locus = fct_relevel(annot.locus, "cds", "ncRNA", "introns", "5UTRs", "3UTRs", "intergenic")) %>%
+  group_by(ID) %>%
+  arrange(annot.locus, by_group = TRUE) %>%
+  summarise(seqnames     = dplyr::first(seqnames),
+            start        = dplyr::first(start),
+            end          = dplyr::first(end),
+            annot.start  = dplyr::first(annot.start),
+            annot.end    = dplyr::first(annot.end),
+            annot.strand = dplyr::first(annot.strand),
+            annot.id     = dplyr::first(annot.id),
+            annot.tx_id  = dplyr::first(annot.tx_id),
+            annot.symbol = dplyr::first(annot.symbol),
+            annot.locus  = dplyr::first(annot.locus),
+            n.annot      = n(),
+            .groups      = "drop") %>%
+  ungroup() %>%
+  mutate(distance_5 = start - annot.start) %>%
+  mutate(distance_3 = annot.end - end) %>%
+  mutate(distance_up   = if_else(annot.strand != "-", distance_5, distance_3)) %>%
+  mutate(distance_down = if_else(annot.strand != "-", distance_3, distance_5)) %>%
+  mutate(annot_size = annot.end - annot.start + 1) %>%
+  mutate(intron_size = if_else(annot.locus == "introns", annot_size, NA_real_)) %>%
+  mutate(dist_acc = if_else(annot.locus == "introns", distance_down, NA_integer_)) %>%
+  dplyr::select(ID, annot.locus, annot.id, annot.tx_id, annot.symbol, annot.strand, intron_size, dist_acc)
+table %>%
+  dplyr::left_join(annotationsTable, by = "ID") %>%
+  dplyr::select(-c(ID)) %>%
+  write_tsv("Data/HumanReads/annotatedBoxAnnotation.tsv")
+```
+
+```{r}
+table      <- read_tsv("Data/HumanReads/annotatedBoxAnnotation.tsv", guess_max = 1000000)
+repeats    <- rtracklayer::import("Data/Annotation/Human/rm.bed.gz", format="bed")
+seqlevelsStyle(repeats) <- "Ensembl"
+tableGR    <- makeGRangesFromDataFrame(table)
+overlaps   <- findOverlaps(tableGR, repeats)
+intersects <- width(pintersect(tableGR[queryHits(overlaps)], repeats[subjectHits(overlaps)], ignore.strand=TRUE, strict.strand=FALSE))
+link <- as_tibble(overlaps) %>%
+  mutate(size = intersects) %>%
+  group_by(queryHits) %>%
+  slice_max(size, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(queryHits, subjectHits)
+table %>%
+  tibble::rowid_to_column("ID") %>%
+  left_join(link, by = c("ID" = "queryHits")) %>%
+  left_join(repeats %>% as_tibble() %>%
+              dplyr::select("name") %>%
+              dplyr::rename("Repeat_name" = name) %>%
+              tibble::rowid_to_column("ID"),
+            by = c("subjectHits" = "ID"),
+            suffix = c("", "_RM")) %>%
+  dplyr::select(-c("ID", "subjectHits")) %>%
+  write_tsv("Data/HumanReads/annotatedBoxAnnotationRM.tsv")
+```
+
+## Analysis 3
+
+```{bash}
+cat Data/Annotation/snoRDClean.fa Data/Annotation/snoRA.fa Data/Annotation/snoEnsembl.fa Data/Annotation/scaRna.fa Data/Annotation/rRna.fa Data/Annotation/mitoRRnaTRna.fa Data/Annotation/tRrna.fa Data/Annotation/preMiRna.fa Data/Annotation/miRnas.fa Data/Annotation/snRna.fa Data/Annotation/forgotten.fa > Data/Annotation/allNotPi.fa
+~/Apps/bowtie2/bowtie2-build Data/Annotation/allNotPi.fa Data/Annotation/allNotPi
+~/Apps/bowtie2/bowtie2 -f --very-sensitive-local -N 1 -X 5000 -p 6 -x Data/Annotation/allNotPi Data/Annotation/piRna.fa --un Data/Annotation/piRnaNoKnown.fa -S /dev/null
+~/Apps/bowtie2/bowtie2 -f --very-sensitive -N 1 -X 5000 --no-unal -p 6 -x ~/Data/M_musculus/Mus_musculus.GRCm38.dna.simple -U Data/Annotation/piRnaNoKnown.fa -S Data/Annotation/piRnaNoKnown.sam
+~/Apps/samtools-1.10/samtools view -@ 6 -b -o Data/Annotation/piRnaNoKnown.bam Data/Annotation/piRnaNoKnown.sam
+rm -f Data/Annotation/piRnaNoKnown.sam
+bedtools bamtobed -i Data/Annotation/piRnaNoKnown.bam > Data/Annotation/piRnaNoKnown.bed
+```
+
+Add box information
+```{r}
+readDNAStringSet("Data/Annotation/piRnaNoKnown.fa") %>%
+  as.data.frame() %>%
+  as_tibble() %>%
+  dplyr::rename(sequence = x) %>%
+  findBestBox(names(cBoxes), cBoxes, TRUE, 5, "C") %>%
+  findBestBox(names(dBoxes), dBoxes, FALSE, 2, "D") %>%
+  findNucleotide() %>%
+  findInterBox() %>%
+  dplyr::filter(! is.na(D_box)) %>%
+  dplyr::filter(! is.na(C_box)) %>%
+  findHelix(fastaFileName, 2) %>%
+  findHelix(fastaFileName, 3) %>%
+  findHelix(fastaFileName, 4) %>%
+  arrange(desc(allCounts)) %>%
+  dplyr::select(-allCounts) %>%
+  dplyr::mutate(size = end - start + 1, .after = end) %>%
+  write_tsv("Data/Annotation/piRNABoxes.tsv")
+```                                                                                                                                                                                                                
