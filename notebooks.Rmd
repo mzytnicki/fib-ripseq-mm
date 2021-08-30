@@ -633,61 +633,6 @@ table %>%
   write_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRM.tsv")
 ```
 
-Compare with Michelle
-```{r}
-michelle <- read_tsv("Data/Feat/merged_tissus.tsv") %>%
-  tibble::rowid_to_column("ID")
-michelle %>%
-  dplyr::mutate(ID = str_c(">", ID)) %>%
-  dplyr::select(ID, Sequence) %>%
-  write_delim("Data/Feat/merged_tissus.fa", delim = "\n", col_names = FALSE)
-read_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRM.tsv", guess_max = 1000000) %>%
-  tibble::rowid_to_column("ID") %>%
-  dplyr::mutate(ID = str_c(">", ID)) %>%
-  dplyr::select(ID, sequence) %>%
-  write_delim("Data/Reads/Sequences/mergedSequenceBoxAnnotationRM.fa", delim = "\n", col_names = FALSE)
-```
-
-```{bash eval=FALSE}
-bowtie-build Data/Feat/merged_tissus.fa Data/Feat/merged_tissus
-bowtie -f -v 2 --norc --best --strata -M 1 --no-unal -S --sam-nohead -p 6 Data/Feat/merged_tissus Data/Reads/Sequences/mergedSequenceBoxAnnotationRM.fa Data/Reads/Sequences/michelle.sam
-  # reads processed: 234434
-  # reads with at least one reported alignment: 12655 (5.40%)
-  # reads that failed to align: 220031 (93.86%)
-  # reads with alignments sampled due to -M: 1748 (0.75%)
-  Reported 12655 alignments
-cut -f 1,3 Data/Reads/Sequences/michelle.sam > Data/Reads/Sequences/michelle.tsv
-```
-
-```{r}
-link <- read_tsv("Data/Reads/Sequences/michelle.tsv", col_names = c("myId", "michelleId"))
-michelle <- read_tsv("Data/Feat/merged_tissus.tsv") %>%
-  dplyr::rename("chrs_michelle"  = chrs) %>%
-  dplyr::rename("start_michelle" = start) %>%
-  dplyr::rename("end_michelle"   = end) %>%
-  tibble::rowid_to_column("michelleId")
-read_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRM.tsv", guess_max = 1000000) %>%
-  tibble::rowid_to_column("myId") %>%
-  left_join(link, by = "myId") %>%
-  left_join(michelle, by = "michelleId") %>%
-  dplyr::select(-c("myId", "michelleId")) %>%
-  write_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRMMichelle.tsv")
-```
-
-```{r}
-read_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRMMichelle.tsv", guess_max = 1000000) %>%
-  dplyr::mutate(allCounts = `body-e15` + `brain-adult` + `brain-e15` + `placenta-e15`) %>%
-  dplyr::filter(! is.na(D_box)) %>%
-  dplyr::filter(! is.na(C_box)) %>%
-  arrange(desc(allCounts)) %>%
-  dplyr::select(-allCounts) %>%
-  tibble::rowid_to_column("ID") %>%
-  dplyr::mutate(ID = str_c("MZ_", ID)) %>%
-  dplyr::mutate(size = end - start + 1, .after = end) %>%
-  write_tsv("Data/Reads/Sequences/mergedSequenceBoxAnnotationRMMichelleClean.tsv")
-```
-
-
 ## Figures
 
 Load data
